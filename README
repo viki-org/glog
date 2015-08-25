@@ -1,3 +1,9 @@
+## This is a fork of golang/glog
+
+What changed:
+
+* Default log level is not set to error anymore
+
 glog
 ====
 
