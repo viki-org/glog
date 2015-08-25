@@ -453,6 +453,10 @@ type loggingT struct {
 	// safely using atomic.LoadInt32.
 	vmodule   moduleSpec // The state of the -vmodule flag.
 	verbosity Level      // V logging level, the value of the -v flag/
+
+	// log format
+	headerFormatStr string
+	footerStr       string
 }
 
 // buffer holds a byte Buffer for reuse. The zero value is ready for use.
@@ -462,7 +466,10 @@ type buffer struct {
 	next *buffer
 }
 
-var logging loggingT
+var logging loggingT = loggingT{
+	headerFormatStr: `{"level":"%c","timestamp":"%s","thread_id":"%d","location":"%s:%d","message":"`,
+	footerStr:       `"}`,
+}
 
 // setVState sets a consistent state for V logging.
 // l.mu is held.
@@ -520,17 +527,15 @@ header formats a log header as defined by the C++ implementation.
 It returns a buffer containing the formatted header and the user's file and line number.
 The depth specifies how many stack frames above lives the source line to be identified in the log message.
 
-Log lines have this form:
-	Lmmdd hh:mm:ss.uuuuuu threadid file:line] msg...
+Log lines are JSON objects so they can also go be read by logstash-forwarder and sent to logging elastic search
+	{"level":"<level>","timestamp":"<timestamp>","threadid":"<threadid>","location":"<location>","message":"<msg>"}
+
 where the fields are defined as follows:
-	L                A single character, representing the log level (eg 'I' for INFO)
-	mm               The month (zero padded; ie May is '05')
-	dd               The day (zero padded)
-	hh:mm:ss.uuuuuu  Time in hours, minutes and fractional seconds
-	threadid         The space-padded thread ID as returned by GetTID()
-	file             The file name
-	line             The line number
-	msg              The user-supplied message
+	<level>           A single character for severity level, which is either I (INFO), W (WARNING), E (ERROR), F (FATAL)
+	<timestamp>       The timestamp as defined in RFC3339 (ISO 8601) format: `yyyy-mm-ddThh-mm-ss(Z)`
+	<threadid>        The space-padded thread ID as returned by GetTID()
+	<location>        The location of the log print, given as `<file>:<line>`
+	<msg>             The user-supplied message
 */
 func (l *loggingT) header(s severity, depth int) (*buffer, string, int) {
 	_, file, line, ok := runtime.Caller(3 + depth)
@@ -557,32 +562,12 @@ func (l *loggingT) formatHeader(s severity, file string, line int) *buffer {
 	}
 	buf := l.getBuffer()
 
-	// Avoid Fprintf, for speed. The format is so simple that we can do it quickly by hand.
-	// It's worth about 3X. Fprintf is hard.
-	_, month, day := now.Date()
-	hour, minute, second := now.Clock()
-	// Lmmdd hh:mm:ss.uuuuuu threadid file:line]
-	buf.tmp[0] = severityChar[s]
-	buf.twoDigits(1, int(month))
-	buf.twoDigits(3, day)
-	buf.tmp[5] = ' '
-	buf.twoDigits(6, hour)
-	buf.tmp[8] = ':'
-	buf.twoDigits(9, minute)
-	buf.tmp[11] = ':'
-	buf.twoDigits(12, second)
-	buf.tmp[14] = '.'
-	buf.nDigits(6, 15, now.Nanosecond()/1000, '0')
-	buf.tmp[21] = ' '
-	buf.nDigits(7, 22, pid, ' ') // TODO: should be TID
-	buf.tmp[29] = ' '
-	buf.Write(buf.tmp[:30])
-	buf.WriteString(file)
-	buf.tmp[0] = ':'
-	n := buf.someDigits(1, line)
-	buf.tmp[n+1] = ']'
-	buf.tmp[n+2] = ' '
-	buf.Write(buf.tmp[:n+3])
+	// sacrify speed obtained by writing to a byte array (around 3X improvement)
+	// right now we prioritize getting logs & centralize them in elastic search / statsd more than logging speed
+	// plus we don't have that many thing to log
+	buf.WriteString(fmt.Sprintf(l.headerFormatStr, severityChar[s], now.Format(time.RFC3339), pid, file, line))
+	// TODO: if not used, remove buf.tmp and associated functions
+
 	return buf
 }
 
@@ -629,7 +614,8 @@ func (buf *buffer) someDigits(i, d int) int {
 
 func (l *loggingT) println(s severity, args ...interface{}) {
 	buf, file, line := l.header(s, 0)
-	fmt.Fprintln(buf, args...)
+	fmt.Fprint(buf, strings.Replace(fmt.Sprint(args...), `"`, `\"`, -1))
+	fmt.Fprintln(buf, l.footerStr)
 	l.output(s, buf, file, line, false)
 }
 
@@ -639,7 +625,8 @@ func (l *loggingT) print(s severity, args ...interface{}) {
 
 func (l *loggingT) printDepth(s severity, depth int, args ...interface{}) {
 	buf, file, line := l.header(s, depth)
-	fmt.Fprint(buf, args...)
+	fmt.Fprint(buf, strings.Replace(fmt.Sprint(args...), `"`, `\"`, -1))
+	fmt.Fprint(buf, l.footerStr)
 	if buf.Bytes()[buf.Len()-1] != '\n' {
 		buf.WriteByte('\n')
 	}
@@ -648,7 +635,8 @@ func (l *loggingT) printDepth(s severity, depth int, args ...interface{}) {
 
 func (l *loggingT) printf(s severity, format string, args ...interface{}) {
 	buf, file, line := l.header(s, 0)
-	fmt.Fprintf(buf, format, args...)
+	fmt.Fprintf(buf, strings.Replace(fmt.Sprintf(format, args...), `"`, `\"`, -1))
+	fmt.Fprint(buf, l.footerStr)
 	if buf.Bytes()[buf.Len()-1] != '\n' {
 		buf.WriteByte('\n')
 	}
@@ -845,7 +833,7 @@ func (sb *syncBuffer) rotateFile(now time.Time) error {
 	fmt.Fprintf(&buf, "Log file created at: %s\n", now.Format("2006/01/02 15:04:05"))
 	fmt.Fprintf(&buf, "Running on machine: %s\n", host)
 	fmt.Fprintf(&buf, "Binary: Built with %s %s for %s/%s\n", runtime.Compiler, runtime.Version(), runtime.GOOS, runtime.GOARCH)
-	fmt.Fprintf(&buf, "Log line format: [IWEF]mmdd hh:mm:ss.uuuuuu threadid file:line] msg\n")
+	fmt.Fprintf(&buf, `Log line format: {"level":"<level>","timestamp":"<timestamp>","threadid":"<threadid>","location":"<location>","message":"<msg>"}\n`)
 	n, err := sb.file.Write(buf.Bytes())
 	sb.nbytes += uint64(n)
 	return err

@@ -3,6 +3,9 @@
 What changed:
 
 * Default log level is not set to error anymore
+* Log are printed in JSON format
+  so logstash-forwarder can pick up & send to logging ealstic search
+* Slower logging speed due to JSON format
 
 glog
 ====
