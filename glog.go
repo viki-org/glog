@@ -467,7 +467,7 @@ type buffer struct {
 }
 
 var logging loggingT = loggingT{
-	headerFormatStr: `{"level":"%c","timestamp":"%s","thread_id":"%d","location":"%s:%d","message":"`,
+	headerFormatStr: `{"level":"%c","timestamp":"%s","thread_id":"%d","location":"%s:%d","msg":"`,
 	footerStr:       `"}`,
 }
 
